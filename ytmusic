@@ -1,85 +1,300 @@
 #!/usr/bin/env python3
-"""Download YouTube Music tracks or playlists without audio conversion."""
+"""Download YouTube Music tracks or playlists as audio plus lyrics when available."""
 import argparse
+import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
 from urllib.parse import parse_qs, urlsplit
 
 
-parser = argparse.ArgumentParser(description="Download YouTube Music audio.")
-parser.add_argument("url", help="YouTube Music or YouTube track/playlist link")
-parser.add_argument("--playlist", action="store_true", help="download the whole playlist")
-parser.add_argument(
-    "--login", metavar="BROWSER[:PROFILE]",
-    help="use an existing browser sign-in, e.g. chrome, firefox, or chrome:Profile 1",
-)
-parser.add_argument(
-    "--audio-format", choices=("mp3", "wma", "ogg", "m4a", "acelp", "flac", "wav", "ape"),
-    default="mp3",
-    help="audio format (default: mp3)",
-)
-parser.add_argument("--ffmpeg-location", help="directory or executable containing ffmpeg and ffprobe")
-parser.add_argument(
-    "output_directory", nargs="?", default=str(Path.home() / "Downloads/YouTube Music"),
-    help="destination folder (default: ~/Downloads/YouTube Music)",
-)
-args = parser.parse_args()
-try:
-    link = urlsplit(args.url)
-except ValueError:
-    parser.error("provide a valid YouTube Music or YouTube track link")
-video_ids = []
-if link.scheme == "https":
-    if link.netloc == "youtu.be":
-        video_ids = [link.path.lstrip("/")]
-    elif link.netloc in ("music.youtube.com", "www.youtube.com", "youtube.com") and link.path == "/watch":
-        video_ids = parse_qs(link.query, keep_blank_values=True).get("v", [])
-if args.playlist:
-    if (link.scheme != "https"
-            or link.netloc not in ("music.youtube.com", "www.youtube.com", "youtube.com")
-            or link.path not in ("/playlist", "/watch")):
-        parser.error("provide a YouTube playlist or watch link containing list=PLAYLIST_ID")
-    playlist_ids = parse_qs(link.query, keep_blank_values=True).get("list", [])
-    if len(playlist_ids) != 1 or not re.fullmatch(r"[A-Za-z0-9_-]+", playlist_ids[0]):
-        parser.error("provide a link with one valid playlist ID")
-    target_url = "https://music.youtube.com/playlist?list=" + playlist_ids[0]
-else:
-    if len(video_ids) != 1 or not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_ids[0]):
-        parser.error("provide a track link with one valid video ID; use --playlist for playlists")
-    target_url = "https://music.youtube.com/watch?v=" + video_ids[0]
-if args.login is not None and not re.fullmatch(
-    r"(?:brave|chrome|chromium|edge|firefox|opera|safari|vivaldi|whale)(?::.+)?", args.login
-):
-    parser.error("--login expects a supported browser name, optionally followed by :PROFILE")
-if not args.output_directory:
-    parser.error("output directory must not be empty")
+INNERTUBE_KEY = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30"
+INNERTUBE_URL = "https://music.youtube.com/youtubei/v1/{endpoint}?alt=json&key=" + INNERTUBE_KEY
 
-downloader = Path(__file__).resolve().parent / ".venv/bin/yt-dlp"
-if not os.access(downloader, os.X_OK):
-    downloader = shutil.which("yt-dlp")
-if not downloader:
-    parser.exit(127, "Missing yt-dlp. On macOS, install with: brew install yt-dlp deno\n")
 
-output_template = "%(title).180B [%(id)s].%(ext)s"
-if args.playlist:
-    output_template = "%(playlist_title,playlist_id).120B [%(playlist_id)s]/%(playlist_index)03d - " + output_template
+def ssl_context():
+    try:
+        import certifi
+    except ImportError:
+        certifi = None
+    for cafile in (
+        certifi.where() if certifi else None,
+        os.environ.get("SSL_CERT_FILE"),
+        "/etc/ssl/cert.pem",
+        "/usr/local/etc/openssl@3/cert.pem",
+        "/opt/homebrew/etc/openssl@3/cert.pem",
+        "/etc/ssl/certs/ca-certificates.crt",
+    ):
+        if cafile and os.path.isfile(cafile):
+            return ssl.create_default_context(cafile=cafile)
+    return ssl.create_default_context()
 
-# Canonical URLs keep the selected track/playlist scope explicit.
-command = [
-    str(downloader), "--ignore-config", "--js-runtimes", "node",
-    "--format", "bestaudio", "--yes-playlist" if args.playlist else "--no-playlist", "--no-overwrites",
-    "--paths", "home:" + args.output_directory,
-    "--output", output_template,
-]
-command.extend(["--extract-audio", "--audio-format", args.audio_format])
-if args.ffmpeg_location:
-    command.extend(["--ffmpeg-location", args.ffmpeg_location])
-if args.login:
-    command.extend(["--cookies-from-browser", args.login])
-command.extend(["--", target_url])
-try:
-    os.execv(str(downloader), command)
-except OSError as error:
-    parser.exit(127, f"Cannot start yt-dlp: {error}\n")
+
+def innertube(endpoint, body, mobile=False):
+    client = (
+        {"clientName": "ANDROID_MUSIC", "clientVersion": "7.21.50"}
+        if mobile
+        else {
+            "clientName": "WEB_REMIX",
+            "clientVersion": "1." + time.strftime("%Y%m%d", time.gmtime()) + ".01.00",
+        }
+    )
+    payload = {"context": {"client": client, "user": {}}, **body}
+    request = urllib.request.Request(
+        INNERTUBE_URL.format(endpoint=endpoint),
+        data=json.dumps(payload).encode(),
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:88.0) Gecko/20100101 Firefox/88.0",
+            "Content-Type": "application/json",
+            "Origin": "https://music.youtube.com",
+            "Cookie": "SOCS=CAI",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=20, context=ssl_context()) as response:
+        return json.load(response)
+
+
+def nested(root, *keys):
+    current = root
+    for key in keys:
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    return current
+
+
+def first_match(root, predicate):
+    if predicate(root):
+        return root
+    if isinstance(root, dict):
+        for value in root.values():
+            found = first_match(value, predicate)
+            if found is not None:
+                return found
+    elif isinstance(root, list):
+        for value in root:
+            found = first_match(value, predicate)
+            if found is not None:
+                return found
+    return None
+
+
+def lyrics_browse_id(watch_response):
+    def is_lyrics_endpoint(node):
+        if not isinstance(node, dict):
+            return False
+        endpoint = node.get("browseEndpoint")
+        if not isinstance(endpoint, dict):
+            return False
+        page_type = nested(
+            endpoint,
+            "browseEndpointContextSupportedConfigs",
+            "browseEndpointContextMusicConfig",
+            "pageType",
+        )
+        return page_type == "MUSIC_PAGE_TYPE_TRACK_LYRICS" and isinstance(endpoint.get("browseId"), str)
+
+    match = first_match(watch_response, is_lyrics_endpoint)
+    if match is None:
+        return None
+    return match["browseEndpoint"]["browseId"]
+
+
+def lrc_timestamp(milliseconds):
+    minutes, rest = divmod(max(0, int(milliseconds)), 60000)
+    seconds, millis = divmod(rest, 1000)
+    return f"[{minutes:02d}:{seconds:02d}.{millis // 10:02d}]"
+
+
+def lyrics_file_text(browse_response):
+    timed = nested(
+        browse_response,
+        "contents",
+        "elementRenderer",
+        "newElement",
+        "type",
+        "componentType",
+        "model",
+        "timedLyricsModel",
+        "lyricsData",
+    )
+    if timed is None:
+        timed = first_match(
+            browse_response,
+            lambda node: isinstance(node, dict) and isinstance(node.get("timedLyricsData"), list),
+        )
+    lines = nested(timed, "timedLyricsData") if isinstance(timed, dict) else None
+    if isinstance(lines, list) and lines:
+        rendered = []
+        for line in lines:
+            if not isinstance(line, dict):
+                continue
+            text = line.get("lyricLine")
+            if not isinstance(text, str):
+                continue
+            start = nested(line, "cueRange", "startTimeMilliseconds")
+            rendered.append((lrc_timestamp(start) + text) if start is not None else text)
+        if rendered:
+            return "\n".join(rendered) + "\n"
+
+    def is_description_shelf(node):
+        return isinstance(node, dict) and "musicDescriptionShelfRenderer" in node
+
+    shelf = first_match(browse_response, is_description_shelf)
+    if shelf is not None:
+        text = nested(shelf, "musicDescriptionShelfRenderer", "description", "runs")
+        if isinstance(text, list):
+            joined = "".join(run.get("text", "") for run in text if isinstance(run, dict))
+            if joined.strip():
+                return joined if joined.endswith("\n") else joined + "\n"
+    return None
+
+
+def fetch_lyrics(video_id):
+    watch = innertube("next", {
+        "videoId": video_id,
+        "playlistId": "RDAMVM" + video_id,
+        "enablePersistentPlaylistPanel": True,
+        "isAudioOnly": True,
+        "tunerSettingValue": "AUTOMIX_SETTING_NORMAL",
+        "watchEndpointMusicSupportedConfigs": {
+            "watchEndpointMusicConfig": {
+                "hasPersistentPlaylistPanel": True,
+                "musicVideoType": "MUSIC_VIDEO_TYPE_ATV",
+            }
+        },
+    })
+    browse_id = lyrics_browse_id(watch)
+    if not browse_id:
+        return None
+    timed_text = lyrics_file_text(innertube("browse", {"browseId": browse_id}, mobile=True))
+    if timed_text:
+        return timed_text
+    return lyrics_file_text(innertube("browse", {"browseId": browse_id}))
+
+
+def write_lyrics_for_file(video_id, audio_path):
+    if not isinstance(video_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        return
+    if not isinstance(audio_path, str) or not audio_path:
+        return
+    lyrics_path = Path(audio_path).with_suffix(".lrc")
+    if lyrics_path.exists():
+        return
+    try:
+        text = fetch_lyrics(video_id)
+        if not text:
+            print(f"No lyrics available for {video_id}", file=sys.stderr)
+            return
+        lyrics_path.write_text(text, encoding="utf-8")
+    except (OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError, ValueError) as error:
+        print(f"Could not fetch lyrics for {video_id}: {error}", file=sys.stderr)
+
+
+def main():
+    if len(sys.argv) >= 4 and sys.argv[1] == "--write-lyrics":
+        write_lyrics_for_file(sys.argv[2], sys.argv[3])
+        raise SystemExit(0)
+    parser = argparse.ArgumentParser(description="Download YouTube Music audio.")
+    parser.add_argument("url", help="YouTube Music or YouTube track/playlist link")
+    parser.add_argument("--playlist", action="store_true", help="download the whole playlist")
+    parser.add_argument(
+        "--login", metavar="BROWSER[:PROFILE]",
+        help="use an existing browser sign-in, e.g. chrome, firefox, or chrome:Profile 1",
+    )
+    parser.add_argument(
+        "--audio-format", choices=("mp3", "wma", "ogg", "m4a", "acelp", "flac", "wav", "ape"),
+        default="mp3",
+        help="audio format (default: mp3)",
+    )
+    parser.add_argument("--ffmpeg-location", help="directory or executable containing ffmpeg and ffprobe")
+    parser.add_argument(
+        "--no-lyrics", action="store_true",
+        help="skip saving a .lrc lyrics file next to each track",
+    )
+    parser.add_argument(
+        "output_directory", nargs="?", default=str(Path.home() / "Downloads/YouTube Music"),
+        help="destination folder (default: ~/Downloads/YouTube Music)",
+    )
+    args = parser.parse_args()
+    try:
+        link = urlsplit(args.url)
+    except ValueError:
+        parser.error("provide a valid YouTube Music or YouTube track link")
+    video_ids = []
+    if link.scheme == "https":
+        if link.netloc == "youtu.be":
+            video_ids = [link.path.lstrip("/")]
+        elif link.netloc in ("music.youtube.com", "www.youtube.com", "youtube.com") and link.path == "/watch":
+            video_ids = parse_qs(link.query, keep_blank_values=True).get("v", [])
+    if args.playlist:
+        if (link.scheme != "https"
+                or link.netloc not in ("music.youtube.com", "www.youtube.com", "youtube.com")
+                or link.path not in ("/playlist", "/watch")):
+            parser.error("provide a YouTube playlist or watch link containing list=PLAYLIST_ID")
+        playlist_ids = parse_qs(link.query, keep_blank_values=True).get("list", [])
+        if len(playlist_ids) != 1 or not re.fullmatch(r"[A-Za-z0-9_-]+", playlist_ids[0]):
+            parser.error("provide a link with one valid playlist ID")
+        target_url = "https://music.youtube.com/playlist?list=" + playlist_ids[0]
+    else:
+        if len(video_ids) != 1 or not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_ids[0]):
+            parser.error("provide a track link with one valid video ID; use --playlist for playlists")
+        target_url = "https://music.youtube.com/watch?v=" + video_ids[0]
+    if args.login is not None and not re.fullmatch(
+        r"(?:brave|chrome|chromium|edge|firefox|opera|safari|vivaldi|whale)(?::.+)?", args.login
+    ):
+        parser.error("--login expects a supported browser name, optionally followed by :PROFILE")
+    if not args.output_directory:
+        parser.error("output directory must not be empty")
+
+    downloader = Path(__file__).resolve().parent / ".venv/bin/yt-dlp"
+    if not os.access(downloader, os.X_OK):
+        downloader = shutil.which("yt-dlp")
+    if not downloader:
+        parser.exit(127, "Missing yt-dlp. On macOS, install with: brew install yt-dlp deno\n")
+
+    output_template = "%(title).180B [%(id)s].%(ext)s"
+    if args.playlist:
+        output_template = "%(playlist_title,playlist_id).120B [%(playlist_id)s]/%(playlist_index)03d - " + output_template
+
+    # Canonical URLs keep the selected track/playlist scope explicit.
+    command = [
+        str(downloader), "--ignore-config", "--js-runtimes", "node",
+        "--format", "bestaudio", "--yes-playlist" if args.playlist else "--no-playlist", "--no-overwrites",
+        "--paths", "home:" + args.output_directory,
+        "--output", output_template,
+    ]
+    command.extend(["--extract-audio", "--audio-format", args.audio_format])
+    if args.ffmpeg_location:
+        command.extend(["--ffmpeg-location", args.ffmpeg_location])
+    if args.login:
+        command.extend(["--cookies-from-browser", args.login])
+    if not args.no_lyrics:
+        command.extend([
+            "--exec",
+            "after_move:"
+            + shlex.join([sys.executable, str(Path(__file__).resolve()), "--write-lyrics"])
+            + " %(id)q %(filepath)q",
+        ])
+    command.extend(["--", target_url])
+    try:
+        raise SystemExit(subprocess.call(command))
+    except OSError as error:
+        parser.exit(127, f"Cannot start yt-dlp: {error}\n")
+
+
+if __name__ == "__main__":
+    script = Path(__file__).resolve()
+    venv_python = script.parent / ".venv/bin/python"
+    if os.access(venv_python, os.X_OK) and Path(sys.prefix).resolve() != (script.parent / ".venv").resolve():
+        os.execv(str(venv_python), [str(venv_python), str(script), *sys.argv[1:]])
+    main()

@@ -7,6 +7,7 @@ WAV, or APE conversion through FFmpeg. DRM is not an output format; `.webm` is n
 ./ytmusic "https://music.youtube.com/watch?v=VIDEO_ID"
 ./ytmusic "https://music.youtube.com/watch?v=VIDEO_ID" "$HOME/Music"
 ./ytmusic --audio-format mp3 "https://music.youtube.com/watch?v=VIDEO_ID"
+./ytmusic --no-lyrics "https://music.youtube.com/watch?v=VIDEO_ID"
 ```
 
 Conversion requires both `ffmpeg` and `ffprobe` on `PATH`. If they are elsewhere, use
@@ -14,8 +15,11 @@ Conversion requires both `ffmpeg` and `ffprobe` on `PATH`. If they are elsewhere
 
 Downloads default to `~/Downloads/YouTube Music`. Filenames include the track's
 title and video ID. Existing files are not overwritten; interrupted downloads
-can resume. A track link containing a playlist parameter downloads just that
-track. Add `--playlist` to download a whole playlist.
+can resume. A `.lrc` lyrics file is written next to each track as soon as that
+track is saved, when YouTube Music provides lyrics (timed when available).
+Missing lyrics are skipped and do not fail the download. Pass `--no-lyrics` to
+skip the lyrics request. A track link containing a playlist parameter downloads
+just that track. Add `--playlist` to download a whole playlist.
 
 ## Playlists and login
 
@@ -49,7 +53,7 @@ chmod +x ytmusic
 ```
 
 Alternatively, install yt-dlp in a Python 3.10+ virtual environment named `.venv`
-beside the script. The script prefers that installation if present. A supported
+beside the script. The script prefers that environment's Python and yt-dlp if present. A supported
 Deno or Node.js runtime must also be available on `PATH`.
 
 ```sh

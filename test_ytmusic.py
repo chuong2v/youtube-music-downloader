@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """Offline command-line checks: python3 test_ytmusic.py."""
+import importlib.machinery
+import importlib.util
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -48,6 +54,12 @@ with tempfile.TemporaryDirectory(prefix="ytmusic test ") as directory:
     assert arguments[arguments.index("--paths") + 1] == f"home:{output}"
     assert arguments[-2:] == ["--", canonical]
     assert "--cookies-from-browser" not in arguments
+    assert "--print-to-file" not in arguments
+    assert arguments[arguments.index("--exec") + 1] == (
+        "after_move:"
+        + shlex.join([sys.executable, str(script.resolve()), "--write-lyrics"])
+        + " %(id)q %(filepath)q"
+    )
 
     result, arguments = run("--audio-format", "flac", url, output)
     assert result.returncode == 0, result.stderr
@@ -123,6 +135,12 @@ with tempfile.TemporaryDirectory(prefix="ytmusic test ") as directory:
         result, arguments = run("--playlist", "--login", browser, playlist)
         assert result.returncode == 2 and result.stderr and arguments is None, browser
 
+    result, arguments = run("--no-lyrics", url, output)
+    assert result.returncode == 0, result.stderr
+    assert "--print-to-file" not in arguments
+    assert "--exec" not in arguments
+    assert arguments[-2:] == ["--", canonical]
+
     result, arguments = run(url, status=19)
     assert result.returncode == 19 and arguments[-1] == canonical
     result, arguments = run("--playlist", playlist, status=19)
@@ -136,4 +154,93 @@ with tempfile.TemporaryDirectory(prefix="ytmusic test ") as directory:
     result, arguments = run(url)
     assert result.returncode == 0 and arguments[-1] == canonical
 
-print("PASS: native audio, track/playlist scope, ordered folders, browser login, literal arguments, defaults, validation, help, exit status, PATH fallback")
+loader = importlib.machinery.SourceFileLoader("ytmusic", str(Path(__file__).with_name("ytmusic")))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+assert isinstance(module.ssl_context(), ssl.SSLContext)
+assert len(module.ssl_context().get_ca_certs()) > 0
+assert module.lrc_timestamp(9200) == "[00:09.20]"
+assert module.lyrics_browse_id({
+    "contents": {
+        "tabRenderer": {
+            "endpoint": {
+                "browseEndpoint": {
+                    "browseId": "MPLYt_test",
+                    "browseEndpointContextSupportedConfigs": {
+                        "browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_TRACK_LYRICS"},
+                    },
+                }
+            }
+        }
+    }
+}) == "MPLYt_test"
+assert module.lyrics_file_text({
+    "contents": {
+        "elementRenderer": {
+            "newElement": {
+                "type": {
+                    "componentType": {
+                        "model": {
+                            "timedLyricsModel": {
+                                "lyricsData": {
+                                    "timedLyricsData": [
+                                        {
+                                            "lyricLine": "I was a liar",
+                                            "cueRange": {"startTimeMilliseconds": "9200"},
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}) == "[00:09.20]I was a liar\n"
+assert module.lyrics_file_text({
+    "contents": {
+        "musicDescriptionShelfRenderer": {
+            "description": {"runs": [{"text": "Today is gonna be the day\n"}]}
+        }
+    }
+}) == "Today is gonna be the day\n"
+
+with tempfile.TemporaryDirectory() as lyrics_dir:
+    audio = Path(lyrics_dir) / "track [abcDEF12_-3].mp3"
+    audio.write_bytes(b"x")
+    original_fetch = module.fetch_lyrics
+    try:
+        module.fetch_lyrics = lambda video_id: "[00:00.00]hello\n"
+        module.write_lyrics_for_file("abcDEF12_-3", str(audio))
+        lyrics = audio.with_suffix(".lrc")
+        assert lyrics.read_text(encoding="utf-8") == "[00:00.00]hello\n"
+        lyrics.write_text("kept\n", encoding="utf-8")
+        module.fetch_lyrics = lambda video_id: (_ for _ in ()).throw(AssertionError("existing lyrics"))
+        module.write_lyrics_for_file("abcDEF12_-3", str(audio))
+        assert lyrics.read_text(encoding="utf-8") == "kept\n"
+        called = []
+        module.fetch_lyrics = lambda video_id: called.append(video_id) or "x"
+        module.write_lyrics_for_file("short", str(audio))
+        assert called == []
+        missing = Path(lyrics_dir) / "other [xyzXYZ12_-3].mp3"
+        missing.write_bytes(b"x")
+        module.fetch_lyrics = lambda video_id: None
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            module.write_lyrics_for_file("xyzXYZ12_-3", str(missing))
+        assert not missing.with_suffix(".lrc").exists()
+        assert "No lyrics available for xyzXYZ12_-3" in captured.getvalue()
+        failed = Path(lyrics_dir) / "fail [abcDEF12_-4].mp3"
+        failed.write_bytes(b"x")
+        module.fetch_lyrics = lambda video_id: (_ for _ in ()).throw(OSError("nope"))
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            module.write_lyrics_for_file("abcDEF12_-4", str(failed))
+        assert not failed.with_suffix(".lrc").exists()
+        assert "Could not fetch lyrics for abcDEF12_-4: nope" in captured.getvalue()
+    finally:
+        module.fetch_lyrics = original_fetch
+
+print("PASS: native audio, track/playlist scope, ordered folders, browser login, literal arguments, defaults, validation, help, exit status, PATH fallback, lyrics sidecar")
